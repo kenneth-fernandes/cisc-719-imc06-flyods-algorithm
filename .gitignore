@@ -6,3 +6,5 @@ p0/part0_notes.log
 p1/modernization_report.aux
 p1/modernization_report.log
 p1/modernization_report.out
+references/chapter 6/*
+.gitignore
