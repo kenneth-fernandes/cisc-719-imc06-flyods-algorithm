@@ -1,0 +1,182 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{enumitem}
+\usepackage{amsmath}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{hyperref}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{blue},
+  commentstyle=\color{gray},
+  breaklines=true,
+  frame=single,
+  numbers=left,
+  numberstyle=\tiny\color{gray}
+}
+
+\title{Part 0 -- Preparation Notes:\\Floyd--Warshall Algorithm and PCAM Analysis}
+\author{Kenny Ferns\\CISC 719 -- IMC06}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+% ============================================================
+\section{What is the Floyd--Warshall Algorithm?}
+% ============================================================
+
+Floyd--Warshall is a classic algorithm that solves the \textbf{All-Pairs Shortest Path (APSP)} problem. In simple terms, given a graph with weighted edges between nodes, it finds the shortest distance between \emph{every} pair of nodes --- not just one source to one destination, but all of them at once.
+
+The algorithm works on a distance matrix $D$ of size $n \times n$, where $n$ is the number of nodes. Initially, $D[i][j]$ holds the direct edge weight from node $i$ to node $j$, or infinity ($\infty$) if there is no direct edge. The diagonal entries $D[i][i]$ are zero because the distance from any node to itself is zero.
+
+The core idea is straightforward: for every possible intermediate node $k$, we check whether going from $i$ to $k$ and then from $k$ to $j$ is shorter than the current known path from $i$ to $j$. If it is, we update the distance. The update rule is:
+
+\[
+D[i][j] \leftarrow \min\bigl(D[i][j],\; D[i][k] + D[k][j]\bigr)
+\]
+
+This is done in-place, meaning we update the same matrix $D$ as we go. The algorithm uses three nested loops: the outermost loop iterates over $k$ (the intermediate node), and the two inner loops iterate over all pairs $(i, j)$. After all $n$ rounds of $k$, every entry $D[i][j]$ contains the true shortest path distance.
+
+A few important properties:
+\begin{itemize}
+  \item The algorithm handles \textbf{negative edge weights} correctly, as long as there are no negative-weight cycles.
+  \item A \textbf{negative cycle} can be detected by checking whether any diagonal entry $D[i][i] < 0$ after the algorithm finishes. If a node can reach itself with a negative total cost, that means a negative cycle exists.
+  \item The time complexity is $O(n^3)$ because of the three nested loops, each running from $0$ to $n-1$.
+  \item The space complexity is $O(n^2)$ for the distance matrix.
+\end{itemize}
+
+To give a concrete example: consider 4 cities A, B, C, D with some roads between them. We fill in a $4 \times 4$ matrix with the direct distances (or $\infty$ where no road exists). Then we run three rounds --- $k = A$, $k = B$, $k = C$, $k = D$ --- and after each round, we have discovered any shorter paths that go through that intermediate city. By the end, the matrix tells us the shortest distance between every pair of cities.
+
+% ============================================================
+\section{What is the PCAM Model?}
+% ============================================================
+
+PCAM stands for \textbf{Partition, Communication, Agglomeration, and Mapping}. It is a systematic methodology introduced by Quinn (Chapter 6) for designing parallel algorithms. The idea is that when you have a large computation to perform, you follow these four steps to figure out how to split the work across multiple processors or threads.
+
+\subsection*{P -- Partition}
+
+The first step is to break the problem into the \textbf{smallest possible independent tasks}. You are not thinking about hardware yet --- you are just identifying all the individual pieces of work.
+
+For Floyd--Warshall, the natural partition is: for a given $k$, each cell $(i, j)$ in the matrix needs one update. So for an $n \times n$ matrix, there are $n^2$ tasks per $k$-step. Each task computes $D[i][j] = \min(D[i][j],\; D[i][k] + D[k][j])$.
+
+\subsection*{C -- Communication}
+
+Once you have partitioned the work, you need to figure out \textbf{what data each task needs from other tasks}. Tasks are rarely fully independent --- they need to read values computed by other tasks.
+
+For Floyd--Warshall, the task that updates cell $(i, j)$ needs two pieces of external data: $D[i][k]$ (a value from column $k$ in the same row) and $D[k][j]$ (a value from row $k$ in the same column). This means that at every $k$-step, row $k$ and column $k$ of the matrix must be available to all tasks. This ``sharing'' of row $k$ and column $k$ is the communication pattern.
+
+\subsection*{A -- Agglomeration}
+
+Having one task per cell is fine in theory, but in practice, launching millions of tiny tasks has overhead. Agglomeration means \textbf{grouping small tasks into larger chunks} to reduce this overhead and improve data reuse.
+
+For example, instead of one thread handling one cell, you could have one thread handle a $16 \times 16$ tile of cells. The benefit is that all 256 cells in that tile need the same 16 values from row $k$ and 16 values from column $k$. You load those 32 values once into fast local memory (shared memory on a GPU) and reuse them 256 times. This dramatically reduces the number of slow global memory reads.
+
+\subsection*{M -- Mapping}
+
+The final step is \textbf{assigning the grouped tasks to actual hardware} --- which processor or thread runs which chunk of work. The goal is to balance the load (every processor gets roughly equal work) and minimize communication between processors.
+
+For Floyd--Warshall on a GPU, mapping means deciding the grid and block dimensions. A common choice is a 2D grid of thread blocks, where each block covers a tile of the matrix, and each thread within the block handles one cell.
+
+% ============================================================
+\section{PCAM Patterns in R1 and R2}
+% ============================================================
+
+R1 (\texttt{floyd\_warshall\_cuda.cu}) is a C++/CUDA implementation, and R2 (\texttt{floyd\_warshall\_fwp\_cuda.ipynb}) is a Python notebook using NumPy and Numba CUDA. Both implement Floyd--Warshall on CPU and GPU. Below, I identify where each PCAM step appears in these two reference files.
+
+\subsection*{[Partition] -- How R1 and R2 Split the Work}
+
+Both R1 and R2 use the finest possible partition: \textbf{one thread per matrix cell $(i, j)$}.
+
+In R1, the CUDA kernel \texttt{floyd\_step\_kernel} (lines 65--82) computes each thread's $(i, j)$ position from its block and thread indices:
+\begin{lstlisting}[language=C++]
+int j = blockIdx.x * blockDim.x + threadIdx.x;
+int i = blockIdx.y * blockDim.y + threadIdx.y;
+\end{lstlisting}
+
+In R2, the Numba CUDA kernel (cell 5) does the same thing using Numba's helper:
+\begin{lstlisting}[language=Python]
+i, j = cuda.grid(2)
+\end{lstlisting}
+
+Each thread is responsible for exactly one update: checking whether $D[i][k] + D[k][j] < D[i][j]$ and updating if so. This is a clean, fine-grained partition where the total number of tasks equals $n^2$ per $k$-step.
+
+The NumPy baseline in R2 (cell 3) partitions differently --- it operates on the entire matrix at once using vectorized broadcasting:
+\begin{lstlisting}[language=Python]
+D = np.minimum(D, D[:, k][:, None] + D[k, :][None, :])
+\end{lstlisting}
+Here, NumPy internally handles the partition across all cells, but the programmer does not see individual threads.
+
+\subsection*{[Communication] -- How R1 and R2 Share Data}
+
+In both R1 and R2, communication happens \textbf{implicitly through global memory}. There are no explicit ``send'' or ``receive'' operations. Instead, every thread reads the values it needs directly from the GPU's global memory.
+
+In R1 (lines 75--76), each thread reads:
+\begin{lstlisting}[language=C++]
+float Dik = D[ik];   // D[i][k] -- from column k
+float Dkj = D[kj];   // D[k][j] -- from row k
+\end{lstlisting}
+
+In R2's Numba kernel (cell 5), each thread does the same:
+\begin{lstlisting}[language=Python]
+Dik = D[i, k]
+Dkj = D[k, j]
+\end{lstlisting}
+
+The key observation is that all threads in the same row $i$ read the same value $D[i][k]$, and all threads in the same column $j$ read the same value $D[k][j]$. This means row $k$ and column $k$ are effectively ``broadcast'' to everyone. On a GPU, this results in many redundant global memory reads, since there is no caching or shared-memory optimization in either R1 or R2.
+
+In the NumPy version (R2, cell 3), communication is handled by extracting entire slices \texttt{D[:, k]} and \texttt{D[k, :]} before broadcasting. NumPy manages the memory access internally.
+
+\subsection*{[Agglomeration] -- What R1 and R2 Group Together}
+
+Both R1 and R2 organize threads into $16 \times 16$ blocks:
+
+In R1 (line 90):
+\begin{lstlisting}[language=C++]
+dim3 block(16, 16);
+\end{lstlisting}
+
+In R2 (cell 5):
+\begin{lstlisting}[language=Python]
+threads = (16, 16)
+\end{lstlisting}
+
+However, this grouping is \textbf{purely organizational} --- it does not exploit data reuse. Within a $16 \times 16$ block, all 256 threads need the same 16 values from row $k$ and 16 values from column $k$. A well-optimized kernel would load these 32 values into GPU shared memory once and let all 256 threads read from there. Neither R1 nor R2 does this. Every thread independently fetches its needed values from slow global memory.
+
+This is the biggest optimization opportunity that R1 and R2 leave on the table. Adding shared-memory tiling would significantly reduce global memory traffic and improve performance.
+
+\subsection*{[Mapping] -- How R1 and R2 Assign Work to Hardware}
+
+Both R1 and R2 use a \textbf{2D grid of thread blocks} that covers the entire $n \times n$ matrix:
+
+In R1 (lines 91--92):
+\begin{lstlisting}[language=C++]
+dim3 grid((n + block.x - 1) / block.x,
+          (n + block.y - 1) / block.y);
+\end{lstlisting}
+
+For $n = 512$ with block size $16 \times 16$, this creates a $32 \times 32$ grid of blocks, totaling $1024 \times 256 = 262{,}144$ threads --- exactly one per matrix cell. The mapping is a direct 1-to-1 correspondence: thread $(tx, ty)$ in block $(bx, by)$ handles cell $(by \cdot 16 + ty,\; bx \cdot 16 + tx)$.
+
+The CPU versions in both R1 and R2 have no parallel mapping at all. The CPU baseline uses a single core running three sequential nested loops. All work is mapped to one processor.
+
+The outer $k$-loop is \textbf{not parallelized} in either R1 or R2. Each $k$-step depends on the results of the previous step, so the host launches one kernel per $k$ value and waits for it to complete before launching the next.
+
+% ============================================================
+\section{Questions}
+% ============================================================
+
+\begin{enumerate}
+  \item \textbf{(R1/R2 -- Block Size Choice)} Both R1 (line 90) and R2 (cell 5) use a block size of $16 \times 16$. Why was $16 \times 16$ chosen instead of $32 \times 32$ or $8 \times 8$? How does block size affect GPU occupancy, register usage, and overall kernel performance?
+
+  \item \textbf{(R1/R2 -- No Shared-Memory Tiling)} Neither R1 nor R2 uses shared memory in their GPU kernels. Every thread independently reads \texttt{D[i][k]} and \texttt{D[k][j]} from global memory (R1 lines 75--76, R2 cell 5). Within a single $16 \times 16$ block, all 16 threads in the same row read the same \texttt{D[i][k]} value, and all 16 threads in the same column read the same \texttt{D[k][j]} value. That means 256 threads produce up to 512 global memory reads, when only 32 unique values are actually needed (16 from row $k$ and 16 from column $k$). Loading these into shared memory once and letting all threads read from there would eliminate this redundancy. Why was this optimization left out, and how much improvement could it provide?
+
+  \item \textbf{(R1/R2 -- One Kernel Launch Per $k$)} In both R1 (lines 94--96) and R2 (cell 5), the host launches a separate kernel for every value of $k$, resulting in $n$ kernel launches for an $n$-node graph. Each launch carries overhead: the GPU must set up the grid, dispatch threads, and synchronize before the next launch. For large $n$ (say 2048), that is 2048 kernel launches, each with a small but non-zero cost. Could multiple $k$-steps be batched or fused into a single kernel (where safe) to reduce this repeated launch and synchronization overhead? What constraints does the data dependency on $k$ impose on such batching?
+
+  \item \textbf{(R1/R2 -- No Hierarchical Decomposition)} Both R1 and R2 use a flat, single-level decomposition: the entire $n \times n$ matrix is covered by one 2D grid of $16 \times 16$ thread blocks. There is no richer hierarchy --- no concept of ``super-tiles'' or multi-level blocking where, for example, the matrix is first divided into large tiles processed by thread block clusters, and then each large tile is further subdivided into smaller sub-tiles processed within a block using shared memory. Such hierarchical decomposition is central to high-performance blocked Floyd--Warshall algorithms (e.g., the 3-phase blocked algorithm with pivot, cross, and remaining tiles). Why does the absence of this hierarchy limit scalability, and how would introducing it improve data locality and reduce global memory traffic?
+
+  \item \textbf{(R1/R2 -- CPU Parallelism Missing or Underused)} The CPU baselines in both R1 (lines 49--60) and R2 (cell 3, NumPy version) run entirely on a single core. R1's CPU implementation is a plain sequential triple loop with no multi-threading. R2's NumPy version benefits from internal vectorization but does not use multiple CPU cores for the outer loops. Neither implementation uses OpenMP, threading, or any explicit multi-core parallelism. For a modern multi-core CPU with 8, 16, or more cores, this leaves significant compute power unused. How would adding OpenMP parallelism over the $i$-loop (or $i$ and $j$ loops) in R1 improve CPU performance, and what synchronization considerations arise given the dependency on $k$?
+\end{enumerate}
+
+\end{document}
