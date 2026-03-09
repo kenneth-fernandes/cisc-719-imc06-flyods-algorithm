@@ -33,19 +33,39 @@ This project implements and compares multiple versions of the Floyd-Warshall all
 
 ## How to Run the Experiments
 
-### Requirements
-- Google Colab (free tier with GPU runtime)
-- Python 3.10+, NumPy, Numba, CuPy, Matplotlib (all pre-installed on Colab)
+### Prerequisites
+- A Google account with access to [Google Colab](https://colab.research.google.com/)
+- No local installation required — all dependencies (Python 3.12, NumPy, Numba, CuPy, Matplotlib) are pre-installed on Colab
 
-### Steps
-1. Upload `p1/imc06_floyd_warshall_experiments.ipynb` to Google Colab
-2. Set runtime to **GPU** (Runtime > Change runtime type > T4 GPU)
-3. Run all cells in order
+### Execution Steps
 
-The notebook runs four variants at problem sizes n = 256, 512, 1024, 2048 and produces:
-- Correctness checks (max diff vs CPU should be 0.0)
-- Timing table with speedups
-- Two plots saved as `floyd_warshall_results.png`
+1. **Upload the notebook**
+   Go to [Google Colab](https://colab.research.google.com/) → File → Upload notebook → select `p1/imc06_floyd_warshall_experiments.ipynb`
+
+2. **Select the GPU runtime**
+   Runtime → Change runtime type → set Hardware accelerator to **T4 GPU** → Save
+
+3. **Run all cells in order**
+   Runtime → Run all (or `Ctrl+F9`)
+
+### What Each Cell Does
+
+| Cell | Description | Expected Output |
+|------|-------------|-----------------|
+| **Cell 1** | Imports, constants, graph generator | Prints a sample 4-node graph; confirms CUDA is available |
+| **Cell 2** | Variant 1 — NumPy CPU baseline | Prints shortest-path result for a 4-node test graph |
+| **Cell 3** | Variant 2 — Naive Numba CUDA kernel (16x16 blocks) | Prints GPU result + max diff vs CPU (should be 0.0) |
+| **Cell 4** | Variant 3 — Tiled Numba CUDA kernel (32x32 blocks + shared memory) | Prints GPU result + max diff vs CPU (should be 0.0) |
+| **Cell 5** | Variant 4 — CuPy GPU broadcasting | Prints GPU result + max diff vs CPU (should be 0.0) |
+| **Cell 6** | Benchmarks — runs all 4 variants at n = 256, 512, 1024, 2048 | Prints runtimes, correctness diffs, and speedups for each size |
+| **Cell 7** | Results — summary table, operations count, and performance plots | Prints formatted results table; saves plot as `floyd_warshall_results.png` |
+
+### Expected Runtime
+- **Total execution time:** ~2–3 minutes on a Tesla T4 GPU (most time is spent on n=2048)
+- The first GPU kernel launch may take a few extra seconds due to Numba JIT compilation
+
+### Verifying Correctness
+Every GPU variant is checked against the CPU baseline. The `diff` column in Cell 6 output should show **0.000000** for all sizes and variants, confirming that all implementations produce identical shortest-path results.
 
 ## Implementations
 
