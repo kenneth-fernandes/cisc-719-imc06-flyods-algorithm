@@ -65,6 +65,11 @@ The notebook runs four variants at problem sizes n = 256, 512, 1024, 2048 and pr
 | 1024 | 1,341.7 | 108.8 | 69.5 | 92.6 | 19.30x (Tiled) |
 | 2048 | 13,607.6 | 526.9 | 367.9 | 629.9 | 36.99x (Tiled) |
 
+## Video Recordings
+
+- **Part 0 (5-min Theory/PCAM Walkthrough):** [Video Link](https://myharrisburgu-my.sharepoint.com/:v:/g/personal/kfernandes_my_harrisburgu_edu/IQAug-7lPTtNQ61X7fIhs012AeY6_gsCXGclUJ7-bgN5Vbc)
+- **Part 3 (10-min Track A Walkthrough):** [Video Link](https://myharrisburgu-my.sharepoint.com/:v:/g/personal/kfernandes_my_harrisburgu_edu/IQCV7EVDJVGeRohjBfbMxT8hAUTspwo_Blqf_85ye0_dY7Y)
+
 ## How to Compile the LaTeX Reports
 
 ```bash
