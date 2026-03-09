@@ -46,9 +46,32 @@ All four variants were tested on Google Colab (Tesla T4 GPU, 16 GB VRAM) at prob
 
 \subsection{Baseline Implementations (from R2)}
 
-\textbf{Variant 1 -- NumPy CPU baseline.} This is the sequential implementation from R2 (cell 3). For each intermediate node $k$, it extracts column $k$ and row $k$ as vectors and uses \texttt{np.minimum} with broadcasting to update the entire $n \times n$ matrix in one step. It runs on a single CPU core.
+\textbf{Variant 1 -- NumPy CPU baseline.} This is the sequential implementation from R2 (cell 3). In our notebook (Cell 2, \texttt{floyd\_warshall\_cpu}), the core loop is:
 
-\textbf{Variant 2 -- Naive Numba CUDA kernel (16$\times$16).} This is the GPU baseline from R2 (cell 5), which mirrors the CUDA C++ kernel in R1 (lines 64--82). For each $k$-step, it launches a 2D grid of threads where each thread updates exactly one cell $(i, j)$. The block size is $16 \times 16 = 256$ threads. Every thread independently reads \texttt{D[i][k]} and \texttt{D[k][j]} from global memory --- there is no shared memory usage.
+\begin{lstlisting}[language=Python]
+for k in range(num_nodes):
+    dist_ik = dist[:, k][:, None]   # column k as (n, 1)
+    dist_kj = dist[k, :][None, :]   # row k as (1, n)
+    dist = np.minimum(dist, dist_ik + dist_kj)
+\end{lstlisting}
+
+For each intermediate node $k$, it extracts column $k$ and row $k$ as vectors and uses \texttt{np.minimum} with broadcasting to update the entire $n \times n$ matrix in one step. It runs on a single CPU core.
+
+\textbf{Variant 2 -- Naive Numba CUDA kernel (16$\times$16).} This is the GPU baseline from R2 (cell 5), which mirrors the CUDA C++ kernel in R1 (lines 64--82). In our notebook (Cell 3, \texttt{naive\_floyd\_kernel}), the kernel is:
+
+\begin{lstlisting}[language=Python]
+@cuda.jit
+def naive_floyd_kernel(dist_matrix, num_nodes, k):
+    i, j = cuda.grid(2)
+    if i < num_nodes and j < num_nodes:
+        dist_i_to_k = dist_matrix[i, k]
+        dist_k_to_j = dist_matrix[k, j]
+        path_through_k = dist_i_to_k + dist_k_to_j
+        if path_through_k < dist_matrix[i, j]:
+            dist_matrix[i, j] = path_through_k
+\end{lstlisting}
+
+For each $k$-step, it launches a 2D grid of threads where each thread updates exactly one cell $(i, j)$. The block size is $16 \times 16 = 256$ threads. Every thread independently reads \texttt{dist\_matrix[i, k]} and \texttt{dist\_matrix[k, j]} from global memory (lines 5--6 of the kernel) --- there is no shared memory usage.
 
 \subsection{Modernization 1: Tiled Kernel with Shared Memory (Variant 3)}
 
@@ -62,19 +85,57 @@ My tiled kernel fixes this with two changes:
   \item \textbf{Shared-memory tiling:} Before updating cells, one row of threads cooperatively loads the 32 values of row $k$ into shared memory, and one column of threads loads the 32 values of column $k$. Then all 1024 threads read from fast shared memory instead of slow global memory. This reduces global memory reads per block from $2 \times 1024 = 2048$ to just $32 + 32 = 64$ --- a \textbf{32$\times$ reduction} in global memory traffic per block.
 \end{enumerate}
 
-\subsection{Modernization 2: CuPy Broadcasting (Variant 4)}
-
-CuPy is a drop-in GPU replacement for NumPy. Instead of writing a manual CUDA kernel, I used CuPy's array operations to run the same broadcasting logic as Variant 1, but entirely on the GPU:
+The core of the tiled kernel (Cell 4, \texttt{tiled\_floyd\_kernel}) is:
 
 \begin{lstlisting}[language=Python]
-dist_gpu = cp.asarray(weight_matrix)  # copy to GPU
-for k in range(num_nodes):
-    dist_ik = dist_gpu[:, k][:, None]
-    dist_kj = dist_gpu[k, :][None, :]
-    dist_gpu = cp.minimum(dist_gpu, dist_ik + dist_kj)
+@cuda.jit
+def tiled_floyd_kernel(dist_matrix, num_nodes, k):
+    shared_row_k = cuda.shared.array(TILE_SIZE, dtype=float32)
+    shared_col_k = cuda.shared.array(TILE_SIZE, dtype=float32)
+
+    local_row = cuda.threadIdx.y
+    local_col = cuda.threadIdx.x
+    global_row = cuda.blockIdx.y * TILE_SIZE + local_row
+    global_col = cuda.blockIdx.x * TILE_SIZE + local_col
+
+    # Cooperative loading into shared memory
+    if local_row == 0 and global_col < num_nodes:
+        shared_row_k[local_col] = dist_matrix[k, global_col]
+    if local_col == 0 and global_row < num_nodes:
+        shared_col_k[local_row] = dist_matrix[global_row, k]
+    cuda.syncthreads()
+
+    # Update using shared memory instead of global memory
+    if global_row < num_nodes and global_col < num_nodes:
+        dist_i_to_k = shared_col_k[local_row]
+        dist_k_to_j = shared_row_k[local_col]
+        path_through_k = dist_i_to_k + dist_k_to_j
+        if path_through_k < dist_matrix[global_row, global_col]:
+            dist_matrix[global_row, global_col] = path_through_k
 \end{lstlisting}
 
-The code is nearly identical to the NumPy version, but \texttt{cp.minimum} and the addition run as GPU kernels automatically. The advantage is simplicity --- no manual thread management. The tradeoff is that each \texttt{cp.minimum} call launches a separate kernel, adding per-$k$ overhead.
+Lines 3--4 allocate shared memory arrays. Lines 12--15 cooperatively load row $k$ and column $k$ values. Line 16 synchronizes all threads. Lines 20--21 read from shared memory instead of global memory.
+
+\subsection{Modernization 2: CuPy Broadcasting (Variant 4)}
+
+CuPy is a drop-in GPU replacement for NumPy. Instead of writing a manual CUDA kernel, I used CuPy's array operations to run the same broadcasting logic as Variant 1, but entirely on the GPU. The full implementation (Cell 5, \texttt{floyd\_warshall\_cupy}) is:
+
+\begin{lstlisting}[language=Python]
+def floyd_warshall_cupy(weight_matrix):
+    # Move matrix from CPU to GPU memory
+    dist_gpu = cp.asarray(weight_matrix.astype(np.float32))
+    num_nodes = dist_gpu.shape[0]
+
+    for k in range(num_nodes):
+        dist_ik = dist_gpu[:, k][:, None]   # column k (n,1)
+        dist_kj = dist_gpu[k, :][None, :]   # row k (1,n)
+        dist_gpu = cp.minimum(dist_gpu, dist_ik + dist_kj)
+
+    cp.cuda.Stream.null.synchronize()
+    return cp.asnumpy(dist_gpu)  # copy result back to CPU
+\end{lstlisting}
+
+The code is nearly identical to the NumPy version (compare with Variant 1 above --- only \texttt{np} is replaced with \texttt{cp}), but \texttt{cp.minimum} and the addition on lines 9 run as GPU kernels automatically. Line 3 transfers data to GPU, and line 12 transfers results back. The advantage is simplicity --- no manual thread management. The tradeoff is that each \texttt{cp.minimum} call (line 9) launches a separate kernel, adding per-$k$ overhead.
 
 % ============================================================
 \section{Benchmark Results}
@@ -205,18 +266,24 @@ That gives an arithmetic intensity of roughly $\frac{2 \text{ FLOPs}}{12 \text{ 
 The naive kernel in R1 (lines 64--82) and R2 (cell 5) has three specific limitations visible in our results:
 
 \begin{enumerate}
-  \item \textbf{Redundant global memory reads:} Every thread independently fetches \texttt{D[i][k]} and \texttt{D[k][j]}. Within a $16 \times 16$ block, 256 threads generate 512 global reads for just 32 unique values. This directly explains why the tiled kernel (which caches these values in shared memory) is 1.43--1.57$\times$ faster at large $n$.
+  \item \textbf{Redundant global memory reads:} In our Variant 2 kernel (Cell 3, lines 5--6 of \texttt{naive\_floyd\_kernel}), every thread independently fetches \texttt{dist\_matrix[i, k]} and \texttt{dist\_matrix[k, j]} from global memory. Within a $16 \times 16$ block, 256 threads generate 512 global reads for just 32 unique values. This directly explains why the tiled kernel (Cell 4, which caches these values in shared memory on lines 12--15) is 1.43--1.57$\times$ faster at large $n$.
 
-  \item \textbf{One kernel launch per $k$:} Both R1 and R2 launch $n$ separate kernels. At $n = 2048$, that is 2,048 launches, each with setup and synchronization overhead. This partially explains CuPy's poor performance at $n = 2048$ --- CuPy launches even more kernels per $k$ (slicing, addition, minimum).
+  \item \textbf{One kernel launch per $k$:} In our Variant 2 wrapper (Cell 3, \texttt{floyd\_warshall\_gpu\_naive}), the host-side loop launches $n$ separate kernels:
+\begin{lstlisting}[language=Python]
+for k in range(num_nodes):
+    naive_floyd_kernel[blocks_per_grid, threads_per_block](
+        dist_device, num_nodes, k)
+\end{lstlisting}
+At $n = 2048$, that is 2,048 launches, each with setup and synchronization overhead. CuPy (Cell 5) has even more overhead --- each $k$ iteration launches multiple internal kernels for slicing, addition, and \texttt{cp.minimum}.
 
-  \item \textbf{Small block size:} The $16 \times 16$ block in R1/R2 uses only 256 of the maximum 1,024 threads per block, potentially underutilizing the GPU's streaming multiprocessors. Our $32 \times 32$ tiled kernel uses all 1,024 threads.
+  \item \textbf{Small block size:} The $16 \times 16$ block in Variant 2 (Cell 3, \texttt{threads\_per\_block = (16, 16)}) uses only 256 of the maximum 1,024 threads per block, potentially underutilizing the GPU's streaming multiprocessors. Our tiled kernel (Cell 4) uses \texttt{TILE\_SIZE = 32}, giving $32 \times 32 = 1{,}024$ threads per block --- the CUDA maximum.
 \end{enumerate}
 
 \subsection{How Our Changes Address These Issues}
 
-\textbf{Variant 3 (tiled kernel)} directly addresses limitation 1 by loading row $k$ and column $k$ into shared memory per block. It also addresses limitation 3 with a larger $32 \times 32$ block. The result: 36.99$\times$ speedup vs CPU at $n = 2048$, compared to 25.83$\times$ for the naive kernel.
+\textbf{Variant 3 (tiled kernel, Cell 4)} directly addresses limitation 1 by loading row $k$ and column $k$ into \texttt{shared\_row\_k} and \texttt{shared\_col\_k} arrays (lines 3--4 of \texttt{tiled\_floyd\_kernel}), then reading from them on lines 20--21. It also addresses limitation 3 with \texttt{TILE\_SIZE = 32}, giving a larger $32 \times 32$ block. The result: 36.99$\times$ speedup vs CPU at $n = 2048$, compared to 25.83$\times$ for the naive kernel.
 
-\textbf{Variant 4 (CuPy)} addresses code complexity --- the implementation is 10 lines of code versus 40+ for Numba kernels. CuPy's internal kernels may use optimizations we do not have access to, which explains its strong performance at $n = 1024$. However, the per-$k$ kernel launch overhead limits it at $n = 2048$.
+\textbf{Variant 4 (CuPy, Cell 5)} addresses code complexity --- \texttt{floyd\_warshall\_cupy} is 12 lines of code versus 40+ for the Numba kernels. CuPy's internal kernels may use optimizations we do not have access to, which explains its strong performance at $n = 1024$. However, the per-$k$ kernel launch overhead from \texttt{cp.minimum} (line 9) limits it at $n = 2048$.
 
 % ============================================================
 \section{Proposed Further Enhancements}
@@ -248,10 +315,6 @@ For very large graphs ($n > 10{,}000$), the matrix may not fit in a single GPU's
 \section{Modern Context}
 % ============================================================
 
-\subsection{Many-Core CPUs}
-
-Our CPU baseline runs on a single core. On a modern CPU with 16--64 cores, adding OpenMP parallelism over the $i$-loop (and optionally the $j$-loop) with cache-friendly tiling could provide 10--30$\times$ speedup over our single-core NumPy baseline. This would make the CPU competitive with the naive GPU kernel, though likely still slower than the tiled kernel for large $n$.
-
 \subsection{When to Use Floyd--Warshall vs Alternatives}
 
 Floyd--Warshall is best suited for \textbf{dense graphs} where most node pairs have edges. Its $O(n^3)$ complexity does not depend on the number of edges. For sparse graphs, running Dijkstra's algorithm from each source ($O(n \cdot E \log n)$) is more efficient. In practice, Floyd--Warshall remains relevant for network routing tables, transitive closure, and dense graph analytics where the all-pairs shortest path matrix is needed.
@@ -261,5 +324,13 @@ Floyd--Warshall is best suited for \textbf{dense graphs} where most node pairs h
 % ============================================================
 
 Starting from R2's reference implementations, I built two modernized GPU variants. The shared-memory tiled kernel (Variant 3) achieved the best performance at every large problem size, reaching \textbf{36.99$\times$} speedup over the CPU baseline at $n = 2048$ and \textbf{1.43$\times$} improvement over the naive GPU kernel. The CuPy broadcasting variant (Variant 4) demonstrated that high-level GPU programming can be competitive (14.48$\times$ at $n = 1024$) while requiring far less code, though it struggles at very large sizes due to kernel launch overhead. The results confirm that Floyd--Warshall is memory-bandwidth bound, and that shared-memory tiling is an effective optimization for reducing redundant global memory traffic on GPUs. Further gains would come from a full 3-phase blocked algorithm and multi-GPU distribution.
+
+% ============================================================
+\section{Video Recording}
+% ============================================================
+
+The 10-minute walkthrough recording for Part 3 (Track A) can be accessed at the following link:
+
+\url{https://myharrisburgu-my.sharepoint.com/:v:/g/personal/kfernandes_my_harrisburgu_edu/IQCV7EVDJVGeRohjBfbMxT8hAUTspwo_Blqf_85ye0_dY7Y}
 
 \end{document}
